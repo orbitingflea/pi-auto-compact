@@ -1,0 +1,10 @@
+{
+  "name": "pi-codex-style-compact",
+  "version": "0.1.0",
+  "description": "Codex-style pre-turn auto-compaction for pi",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "keywords": ["pi", "extension", "compaction", "codex"],
+  "license": "MIT"
+}
