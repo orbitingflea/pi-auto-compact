@@ -1,13 +1,34 @@
 {
-  "name": "pi-auto-compact",
-  "version": "0.2.0",
+  "name": "@capyup/pi-auto-compact",
+  "version": "0.2.1",
   "description": "Pre-turn auto-compaction for pi",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "auto-compact",
+    "compaction",
+    "context-window"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/capyup/pi-auto-compact"
+  },
+  "author": "capyup",
+  "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
-  },
-  "license": "MIT"
+  }
 }

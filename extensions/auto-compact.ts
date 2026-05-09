@@ -1,18 +1,17 @@
 /**
  * Pre-Turn Auto-Compaction for Pi
  *
- * This extension implements a proactive compaction strategy (inspired by Codex):
+ * This extension implements a proactive compaction strategy:
  * 1. Pre-turn check: Before each LLM request, check token usage
- * 2. Mid-turn check: After tool execution, if follow-up needed, check again
+ * 2. Mid-turn check: After tool execution, before follow-up LLM calls
+ * 3. Emergency: Synchronous truncation via `context` event as last resort
  *
  * Key difference from pi's default:
  * - Pi only checks after `agent_end`
  * - This extension checks BEFORE sending requests to LLM
  *
- * Strategy:
- * - Use `context` event for emergency truncation (synchronous, immediate)
- * - Use `turn_start` to trigger proper compaction (async, with summary)
- * - Use `turn_end` to trigger mid-turn compaction if needed
+ * After compaction, pi automatically continues with the summarized context —
+ * no follow-up user message is needed.
  */
 
 import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-works/pi-coding-agent";
@@ -256,10 +255,7 @@ export default function autoCompact(pi: ExtensionAPI) {
   let lastEstimatedTokens = 0;
   let truncationAppliedThisTurn = false;
   
-  // Track whether the current compaction is automatic (needs follow-up) or manual (no follow-up)
-  let isAutoCompaction = false;
-  // Track the reason for auto-compaction to generate appropriate follow-up
-  let autoCompactionPhase: "pre-turn" | "mid-turn" | "emergency" | null = null;
+
   
   // Cache computed limits per model
   let cachedContextWindow = 0;
@@ -314,12 +310,10 @@ export default function autoCompact(pi: ExtensionAPI) {
 
     if (tokens >= cachedAutoCompactLimit) {
       pendingCompaction = true;
-      isAutoCompaction = true;
-      autoCompactionPhase = "pre-turn";
       ctx.compact({
         customInstructions: "Focus on preserving task context and recent work.",
         onComplete: () => { pendingCompaction = false; },
-        onError: () => { pendingCompaction = false; isAutoCompaction = false; autoCompactionPhase = null; },
+        onError: () => { pendingCompaction = false; },
       });
     }
   });
@@ -337,13 +331,11 @@ export default function autoCompact(pi: ExtensionAPI) {
       if (newMessages) {
         truncationAppliedThisTurn = true;
         pendingCompaction = true;
-        isAutoCompaction = true;
-        autoCompactionPhase = "emergency";
         setImmediate(() => {
           ctx.compact({
             customInstructions: "Emergency context truncation was applied. Generate a comprehensive summary.",
             onComplete: () => { pendingCompaction = false; },
-            onError: () => { pendingCompaction = false; isAutoCompaction = false; autoCompactionPhase = null; },
+            onError: () => { pendingCompaction = false; },
           });
         });
         return { messages: newMessages };
@@ -364,12 +356,10 @@ export default function autoCompact(pi: ExtensionAPI) {
     const tokens = getTokenUsage(ctx);
     if (tokens >= cachedAutoCompactLimit && !pendingCompaction) {
       pendingCompaction = true;
-      isAutoCompaction = true;
-      autoCompactionPhase = "mid-turn";
       ctx.compact({
         customInstructions: "Mid-turn compaction: preserve current task context and tool call results.",
         onComplete: () => { pendingCompaction = false; },
-        onError: () => { pendingCompaction = false; isAutoCompaction = false; autoCompactionPhase = null; },
+        onError: () => { pendingCompaction = false; },
       });
     }
   });
@@ -378,8 +368,6 @@ export default function autoCompact(pi: ExtensionAPI) {
     pendingCompaction = false;
     truncationAppliedThisTurn = false;
     lastEstimatedTokens = 0;
-    isAutoCompaction = false;
-    autoCompactionPhase = null;
 
     await restoreSettings();
 
@@ -389,45 +377,16 @@ export default function autoCompact(pi: ExtensionAPI) {
         lastEstimatedTokens = usage.tokens;
         updateCachedLimits(ctx as unknown as { model?: { contextWindow?: number } });
         if (usage.tokens >= cachedAutoCompactLimit) {
-          isAutoCompaction = true;
-          autoCompactionPhase = "pre-turn";
           ctx.compact({
             onComplete: () => {},
-            onError: () => { isAutoCompaction = false; autoCompactionPhase = null; },
+            onError: () => {},
           });
         }
       }
     }
   });
 
-  pi.on("session_before_compact", async () => {
-    if (!autoCompactionPhase) isAutoCompaction = false;
-  });
 
-  pi.on("session_compact", async () => {
-    if (isAutoCompaction && autoCompactionPhase) {
-      const phase = autoCompactionPhase;
-      isAutoCompaction = false;
-      autoCompactionPhase = null;
-
-      let followUpMessage: string;
-      switch (phase) {
-        case "pre-turn":
-          followUpMessage = "Context was compacted before processing. Continue with the current task.";
-          break;
-        case "mid-turn":
-          followUpMessage = "Context was compacted mid-turn. Continue executing the remaining work.";
-          break;
-        case "emergency":
-          followUpMessage = "Emergency context compaction was applied. Resume the current task where we left off.";
-          break;
-        default:
-          followUpMessage = "Context compacted. Continue.";
-      }
-
-      pi.sendUserMessage(followUpMessage, { deliverAs: "followUp" });
-    }
-  });
 
   // =========================================================================
   // Settings persistence helpers
@@ -578,7 +537,6 @@ export default function autoCompact(pi: ExtensionAPI) {
           `  Usage: ${percent.toFixed(1)}%\n` +
           `  Strategy: ${STRATEGY_LABELS[config.strategy]}\n` +
           `  Pending compaction: ${pendingCompaction}\n` +
-          `  Auto compaction: ${isAutoCompaction} (${autoCompactionPhase ?? "none"})\n` +
           `  Truncation this turn: ${truncationAppliedThisTurn}`,
           "info"
         );

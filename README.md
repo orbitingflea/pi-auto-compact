@@ -51,18 +51,20 @@ For a 200K context window model:
 
 As a pi package:
 
-```json
-{
-  "packages": [
-    "git:github.com/lulucatdev/pi-auto-compact"
-  ]
-}
+```bash
+pi install npm:@capyup/pi-auto-compact
+```
+
+Or via git:
+
+```bash
+pi install git:github.com/capyup/pi-auto-compact
 ```
 
 Or run directly:
 
 ```bash
-pi -e ./src/index.ts
+pi -e ./extensions/auto-compact.ts
 ```
 
 ## How It Differs from Pi's Default
