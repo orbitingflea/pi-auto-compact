@@ -14,6 +14,27 @@ This extension checks tokens at **three points**:
 2. **Mid-turn:** After tool execution, before follow-up LLM calls (`turn_end`)
 3. **Emergency:** Synchronous truncation in the `context` event as a last resort
 
+It also handles the **session resume** case: when an existing session is
+reopened above the threshold, compaction kicks off as soon as the session
+starts.
+
+### Continuing After Auto-Compaction
+
+`ctx.compact()` aborts the running agent internally, so without a nudge the
+session would sit idle once the summary is written. After every
+**auto-triggered** compaction this extension sends a short English follow-up
+user message to make pi resume the in-flight task. The exact wording depends
+on which check fired (pre-turn, mid-turn, emergency, or session-resume).
+
+The follow-up is suppressed in two cases:
+
+- The user ran `/compact` manually — the callback path used here only fires
+  for compactions this extension started, so manual compaction is never
+  touched.
+- The agent is no longer idle when the summary finishes, e.g. the user
+  already typed something or another extension started a turn while
+  summarising. Their input acts as the kickoff and we stay quiet.
+
 ### Compaction Strategies
 
 | Strategy | Description |
@@ -74,7 +95,7 @@ pi -e ./extensions/auto-compact.ts
 | Check timing | After `agent_end` only | Before requests + after tools |
 | Overflow protection | None | Emergency truncation |
 | Mid-turn handling | None | Checks after each tool batch |
-| Auto-continue | No | Yes (after auto-compact) |
+| Auto-continue | No | Yes — sends an English follow-up nudge after auto-compaction |
 
 ## License
 

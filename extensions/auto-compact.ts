@@ -10,8 +10,14 @@
  * - Pi only checks after `agent_end`
  * - This extension checks BEFORE sending requests to LLM
  *
- * After compaction, pi automatically continues with the summarized context —
- * no follow-up user message is needed.
+ * Follow-up after compaction:
+ * `ctx.compact()` aborts the streaming agent internally, so the agent will be
+ * idle once compaction finishes. Auto-compaction therefore needs a small
+ * follow-up user message to make pi resume the in-flight task. We only send
+ * the follow-up when (a) we triggered the compaction ourselves — guaranteed
+ * by using `ctx.compact`'s `onComplete` callback, which never fires for the
+ * user's manual `/compact` — and (b) the agent is still idle (i.e. the user
+ * has not already typed something while we were summarising).
  */
 
 import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-works/pi-coding-agent";
@@ -254,9 +260,41 @@ export default function autoCompact(pi: ExtensionAPI) {
   let pendingCompaction = false;
   let lastEstimatedTokens = 0;
   let truncationAppliedThisTurn = false;
-  
 
-  
+  // Phase-specific follow-up nudges, sent only when auto-compaction completes
+  // and the agent is still idle. Manual `/compact` never reaches this path.
+  type AutoCompactPhase = "pre-turn" | "mid-turn" | "emergency" | "session-resume";
+  const AUTO_COMPACT_FOLLOW_UP: Record<AutoCompactPhase, string> = {
+    "pre-turn":       "Auto-compact ran before this turn. Continue with the current task.",
+    "mid-turn":       "Auto-compact ran mid-turn. Continue executing the remaining work.",
+    "emergency":      "Emergency auto-compact ran. Resume where we left off.",
+    "session-resume": "Auto-compact ran on session resume. Continue with the active task.",
+  };
+
+  const triggerAutoCompact = (
+    ctx: ExtensionContext,
+    phase: AutoCompactPhase,
+    customInstructions?: string,
+  ): void => {
+    pendingCompaction = true;
+    ctx.compact({
+      customInstructions,
+      onComplete: () => {
+        pendingCompaction = false;
+        // ctx.compact() aborts the running agent, so the only times isIdle()
+        // is false here are: the user typed something while we were
+        // summarising, or another extension kicked off a new turn. In both
+        // cases the new input acts as the follow-up and we stay quiet.
+        if (ctx.isIdle()) {
+          pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+        }
+      },
+      onError: () => {
+        pendingCompaction = false;
+      },
+    });
+  };
+
   // Cache computed limits per model
   let cachedContextWindow = 0;
   let cachedAutoCompactLimit = 0;
@@ -309,12 +347,11 @@ export default function autoCompact(pi: ExtensionAPI) {
     const tokens = getTokenUsage(ctx);
 
     if (tokens >= cachedAutoCompactLimit) {
-      pendingCompaction = true;
-      ctx.compact({
-        customInstructions: "Focus on preserving task context and recent work.",
-        onComplete: () => { pendingCompaction = false; },
-        onError: () => { pendingCompaction = false; },
-      });
+      triggerAutoCompact(
+        ctx,
+        "pre-turn",
+        "Focus on preserving task context and recent work.",
+      );
     }
   });
 
@@ -330,13 +367,12 @@ export default function autoCompact(pi: ExtensionAPI) {
 
       if (newMessages) {
         truncationAppliedThisTurn = true;
-        pendingCompaction = true;
         setImmediate(() => {
-          ctx.compact({
-            customInstructions: "Emergency context truncation was applied. Generate a comprehensive summary.",
-            onComplete: () => { pendingCompaction = false; },
-            onError: () => { pendingCompaction = false; },
-          });
+          triggerAutoCompact(
+            ctx,
+            "emergency",
+            "Emergency context truncation was applied. Generate a comprehensive summary.",
+          );
         });
         return { messages: newMessages };
       }
@@ -355,12 +391,11 @@ export default function autoCompact(pi: ExtensionAPI) {
 
     const tokens = getTokenUsage(ctx);
     if (tokens >= cachedAutoCompactLimit && !pendingCompaction) {
-      pendingCompaction = true;
-      ctx.compact({
-        customInstructions: "Mid-turn compaction: preserve current task context and tool call results.",
-        onComplete: () => { pendingCompaction = false; },
-        onError: () => { pendingCompaction = false; },
-      });
+      triggerAutoCompact(
+        ctx,
+        "mid-turn",
+        "Mid-turn compaction: preserve current task context and tool call results.",
+      );
     }
   });
 
@@ -377,10 +412,7 @@ export default function autoCompact(pi: ExtensionAPI) {
         lastEstimatedTokens = usage.tokens;
         updateCachedLimits(ctx as unknown as { model?: { contextWindow?: number } });
         if (usage.tokens >= cachedAutoCompactLimit) {
-          ctx.compact({
-            onComplete: () => {},
-            onError: () => {},
-          });
+          triggerAutoCompact(ctx, "session-resume");
         }
       }
     }
