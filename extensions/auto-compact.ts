@@ -281,13 +281,27 @@ export default function autoCompact(pi: ExtensionAPI) {
       customInstructions,
       onComplete: () => {
         pendingCompaction = false;
-        // ctx.compact() aborts the running agent, so the only times isIdle()
-        // is false here are: the user typed something while we were
-        // summarising, or another extension kicked off a new turn. In both
-        // cases the new input acts as the follow-up and we stay quiet.
-        if (ctx.isIdle()) {
-          pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
-        }
+        // ctx.compact() aborts the running agent, so we generally see
+        // isIdle() === true here. But pi also flushes its own
+        // `compactionQueuedMessages` (anything the user typed during
+        // summarisation) synchronously off the `compaction_end` event,
+        // and that flush runs `session.prompt()` without streamingBehavior.
+        //
+        // If we send our nudge in the same tick we race that flush:
+        // whoever reaches `agent.run()` first sets isStreaming=true, and
+        // the other prompt() throws "Agent is already processing", which
+        // pi surfaces as "Failed to send queued message: ...".
+        //
+        // Defer past all pending microtasks so that flush's prompt() has
+        // settled into its final state. After setImmediate, isIdle()
+        // honestly reflects whether anything else is about to drive a
+        // turn. If something is, the new input acts as the follow-up and
+        // we stay quiet; otherwise we kick the agent ourselves.
+        setImmediate(() => {
+          if (ctx.isIdle()) {
+            pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+          }
+        });
       },
       onError: () => {
         pendingCompaction = false;
