@@ -1,6 +1,6 @@
 {
   "name": "@capyup/pi-auto-compact",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Pre-turn auto-compaction for pi",
   "keywords": [
     "pi-package",
