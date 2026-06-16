@@ -13,11 +13,12 @@
  * Follow-up after compaction:
  * `ctx.compact()` aborts the streaming agent internally, so the agent will be
  * idle once compaction finishes. Auto-compaction therefore needs a small
- * follow-up user message to make pi resume the in-flight task. We only send
- * the follow-up when (a) we triggered the compaction ourselves — guaranteed
- * by using `ctx.compact`'s `onComplete` callback, which never fires for the
- * user's manual `/compact` — and (b) the agent is still idle (i.e. the user
- * has not already typed something while we were summarising).
+ * hidden custom message to make pi resume the in-flight task without appearing
+ * as a new user turn in the session UI. We only send the follow-up when (a) we
+ * triggered the compaction ourselves — guaranteed by using `ctx.compact`'s
+ * `onComplete` callback, which never fires for the user's manual `/compact` —
+ * and (b) the agent is still idle (i.e. the user has not already typed
+ * something while we were summarising).
  */
 
 import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-works/pi-coding-agent";
@@ -299,7 +300,15 @@ export default function autoCompact(pi: ExtensionAPI) {
         // we stay quiet; otherwise we kick the agent ourselves.
         setImmediate(() => {
           if (ctx.isIdle()) {
-            pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+            pi.sendMessage(
+              {
+                customType: "auto-compact-follow-up",
+                content: AUTO_COMPACT_FOLLOW_UP[phase],
+                display: false,
+                details: { phase },
+              },
+              { triggerTurn: true },
+            );
           }
         });
       },

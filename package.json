@@ -20,6 +20,9 @@
     "extensions",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "publishConfig": {
     "access": "public"
   },
