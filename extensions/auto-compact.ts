@@ -2,7 +2,8 @@
  * Pre-Turn Auto-Compaction for Pi
  *
  * This extension implements a proactive compaction strategy:
- * 1. Pre-turn check: Before each LLM request, check token usage
+ * 1. Pre-turn check: When user input arrives, check token usage before the
+ *    user message is handed to the agent
  * 2. Mid-turn check: After tool execution, before follow-up LLM calls
  * 3. Emergency: Synchronous truncation via `context` event as last resort
  *
@@ -12,12 +13,15 @@
  *
  * Follow-up after compaction:
  * `ctx.compact()` aborts the streaming agent internally, so the agent will be
- * idle once compaction finishes. Auto-compaction therefore needs a small
- * follow-up user message to make pi resume the in-flight task. We only send
- * the follow-up when (a) we triggered the compaction ourselves — guaranteed
- * by using `ctx.compact`'s `onComplete` callback, which never fires for the
- * user's manual `/compact` — and (b) the agent is still idle (i.e. the user
- * has not already typed something while we were summarising).
+ * idle once compaction finishes. Mid-turn, emergency, and session-resume
+ * compactions therefore need a small follow-up user message to make pi resume
+ * the in-flight task.
+ *
+ * Pre-turn compaction is different: the user's just-submitted message has not
+ * reached pi's message history yet. If we compact from `turn_start`, the abort
+ * can drop that message before `message_end` persists it. Instead, the
+ * `input` handler intercepts the prompt, compacts while idle, then replays the
+ * original user input after compaction completes.
  */
 
 import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-works/pi-coding-agent";
@@ -261,20 +265,28 @@ export default function autoCompact(pi: ExtensionAPI) {
   let lastEstimatedTokens = 0;
   let truncationAppliedThisTurn = false;
 
+  type UserReplayContent = Parameters<ExtensionAPI["sendUserMessage"]>[0];
+
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
   type AutoCompactPhase = "pre-turn" | "mid-turn" | "emergency" | "session-resume";
-  const AUTO_COMPACT_FOLLOW_UP: Record<AutoCompactPhase, string> = {
-    "pre-turn":       "Auto-compact ran before this turn. Continue with the current task.",
+  const AUTO_COMPACT_FOLLOW_UP: Record<Exclude<AutoCompactPhase, "pre-turn">, string> = {
     "mid-turn":       "Auto-compact ran mid-turn. Continue executing the remaining work.",
     "emergency":      "Emergency auto-compact ran. Resume where we left off.",
     "session-resume": "Auto-compact ran on session resume. Continue with the active task.",
+  };
+
+  const buildReplayContent = (text: string, images: unknown): UserReplayContent => {
+    const imageParts = Array.isArray(images) ? images : [];
+    if (imageParts.length === 0) return text;
+    return [{ type: "text", text }, ...imageParts] as UserReplayContent;
   };
 
   const triggerAutoCompact = (
     ctx: ExtensionContext,
     phase: AutoCompactPhase,
     customInstructions?: string,
+    replayAfterCompact?: UserReplayContent,
   ): void => {
     pendingCompaction = true;
     ctx.compact({
@@ -287,19 +299,26 @@ export default function autoCompact(pi: ExtensionAPI) {
         // summarisation) synchronously off the `compaction_end` event,
         // and that flush runs `session.prompt()` without streamingBehavior.
         //
-        // If we send our nudge in the same tick we race that flush:
-        // whoever reaches `agent.run()` first sets isStreaming=true, and
-        // the other prompt() throws "Agent is already processing", which
-        // pi surfaces as "Failed to send queued message: ...".
+        // If we send in the same tick we race that flush: whoever reaches
+        // `agent.run()` first sets isStreaming=true, and the other prompt()
+        // throws "Agent is already processing", which pi surfaces as
+        // "Failed to send queued message: ...".
         //
         // Defer past all pending microtasks so that flush's prompt() has
         // settled into its final state. After setImmediate, isIdle()
-        // honestly reflects whether anything else is about to drive a
-        // turn. If something is, the new input acts as the follow-up and
-        // we stay quiet; otherwise we kick the agent ourselves.
+        // honestly reflects whether anything else is about to drive a turn.
         setImmediate(() => {
+          const content = replayAfterCompact ?? (phase === "pre-turn" ? undefined : AUTO_COMPACT_FOLLOW_UP[phase]);
+          if (!content) return;
+
           if (ctx.isIdle()) {
-            pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+            pi.sendUserMessage(content);
+          } else if (replayAfterCompact !== undefined) {
+            // The intercepted user prompt must not be dropped just because
+            // another queued prompt won the post-compaction race. If another
+            // turn is already running, preserve the original input as a
+            // follow-up rather than replacing it with a generic nudge.
+            pi.sendUserMessage(content, { deliverAs: "followUp" });
           }
         });
       },
@@ -337,10 +356,17 @@ export default function autoCompact(pi: ExtensionAPI) {
     }
   };
 
+  type UsageContext = {
+    getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+    model?: { contextWindow?: number };
+  };
+
   /**
-   * Get context usage from pi's API and update cached limits.
+   * Get measured context usage from pi's API and update cached limits.
+   * Returns null when pi intentionally reports usage as unknown, e.g. right
+   * after compaction before a post-compaction assistant response exists.
    */
-  const getTokenUsage = (ctx: { getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined; model?: { contextWindow?: number } }) => {
+  const getMeasuredTokenUsage = (ctx: UsageContext): number | null => {
     const usage = ctx.getContextUsage();
     
     // Update cached limits based on current model
@@ -353,20 +379,52 @@ export default function autoCompact(pi: ExtensionAPI) {
     if (usage && usage.tokens !== null) {
       return usage.tokens;
     }
-    return lastEstimatedTokens;
+    return null;
   };
 
-  pi.on("turn_start", async (event, ctx) => {
-    truncationAppliedThisTurn = false;
-    const tokens = getTokenUsage(ctx);
+  /**
+   * Get context usage, falling back to the last context-event estimate when
+   * no measured usage exists. This is useful mid-turn but intentionally not
+   * used for pre-turn input interception to avoid repeated compaction from a
+   * stale pre-compaction estimate.
+   */
+  const getTokenUsage = (ctx: UsageContext): number => {
+    return getMeasuredTokenUsage(ctx) ?? lastEstimatedTokens;
+  };
 
-    if (tokens >= cachedAutoCompactLimit) {
+  pi.on("input", async (event, ctx) => {
+    // Extension-injected replay/follow-up messages must not recursively trigger
+    // another pre-turn compaction. Streaming user input is already handled by
+    // pi's queue and should not be intercepted here either.
+    if (event.source === "extension" || event.streamingBehavior) {
+      return { action: "continue" as const };
+    }
+
+    // Extension commands are handled before the input event, but prompt
+    // templates and /skill commands expand afterward. pi.sendUserMessage()
+    // intentionally skips that expansion for extension-originated messages, so
+    // do not intercept slash-prefixed input unless pi exposes a replay path that
+    // preserves normal expansion semantics.
+    if (event.text.trimStart().startsWith("/")) {
+      return { action: "continue" as const };
+    }
+
+    const tokens = getMeasuredTokenUsage(ctx);
+    if (tokens !== null && tokens >= cachedAutoCompactLimit && !pendingCompaction) {
       triggerAutoCompact(
         ctx,
         "pre-turn",
         "Focus on preserving task context and recent work.",
+        buildReplayContent(event.text, event.images),
       );
+      return { action: "handled" as const };
     }
+
+    return { action: "continue" as const };
+  });
+
+  pi.on("turn_start", async () => {
+    truncationAppliedThisTurn = false;
   });
 
   pi.on("context", async (event, ctx) => {
