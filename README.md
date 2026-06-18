@@ -33,12 +33,13 @@ prompt is re-submitted so the user's input is not lost. This avoids the
 `turn_start` race where compaction could abort the newly-started turn before
 the user's message reached chat history or `/tree`.
 
-Interactive slash-prefixed inputs are left alone because pi expands prompt
-templates and `/skill` commands after the `input` event, while extension replay
-intentionally skips that expansion. RPC inputs are also left on Pi's normal path
-so API callers keep ownership of the request/response. Streaming steer/follow-up
-inputs are left alone as well: compacting during the `input` event would abort
-the active turn before pi can queue the user's steer/follow-up.
+Only TUI inputs are intercepted. Print/JSON/SDK/RPC callers stay on Pi's normal
+path so their original request owns the response. Interactive slash-prefixed
+inputs are left alone because pi expands prompt templates and `/skill` commands
+after the `input` event, while extension replay intentionally skips that
+expansion. Streaming steer/follow-up inputs are left alone as well: compacting
+during the `input` event would abort the active turn before pi can queue the
+user's steer/follow-up.
 
 The follow-up is suppressed in two cases:
 

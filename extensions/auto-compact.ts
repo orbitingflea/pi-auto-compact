@@ -473,9 +473,16 @@ export default function autoCompact(pi: ExtensionAPI) {
       return { action: "continue" as const };
     }
 
-    // RPC callers expect their session.prompt() call to own the resulting turn;
-    // replaying later via pi.sendUserMessage() would detach the response from
-    // the original request. Let RPC prompts follow Pi's normal path.
+    // Non-TUI callers (print/json/SDK/RPC) expect their session.prompt() call
+    // to own the resulting turn. Replaying later via pi.sendUserMessage() would
+    // detach the response from the original request, so only TUI input is
+    // intercepted here.
+    if (ctx.mode !== "tui") {
+      return { action: "continue" as const };
+    }
+
+    // RPC callers should already be covered by ctx.mode, but keep the source
+    // guard for clarity and future mixed-mode entry points.
     if (event.source === "rpc") {
       return { action: "continue" as const };
     }
@@ -503,8 +510,8 @@ export default function autoCompact(pi: ExtensionAPI) {
     if (projectedTokens !== null && projectedTokens >= cachedAutoCompactLimit && !pendingCompaction) {
       // Returning handled necessarily owns replay for this event. Pi does not
       // currently expose a normal-source, post-middleware replay path, so keep
-      // this path limited to inputs where out-of-band replay preserves caller
-      // expectations: interactive prompts and non-RPC extension prompts.
+      // this path limited to TUI inputs where out-of-band replay preserves
+      // caller expectations.
       triggerAutoCompact(
         ctx,
         "pre-turn",
