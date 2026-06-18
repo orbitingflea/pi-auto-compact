@@ -269,6 +269,7 @@ export default function autoCompact(pi: ExtensionAPI) {
   type UserReplayOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 
   const ownReplayInputs = new Map<string, number>();
+  let pendingOwnReplayInputs = 0;
 
   const replayKey = (text: string, images: unknown): string => {
     return `${text}\u0000${JSON.stringify(Array.isArray(images) ? images : [])}`;
@@ -292,16 +293,38 @@ export default function autoCompact(pi: ExtensionAPI) {
   const markOwnReplay = (content: UserReplayContent): void => {
     const { text, images } = normalizeReplayContent(content);
     const key = replayKey(text, images);
+    pendingOwnReplayInputs += 1;
     ownReplayInputs.set(key, (ownReplayInputs.get(key) ?? 0) + 1);
+  };
+
+  const decrementAnyOwnReplay = (): void => {
+    pendingOwnReplayInputs = Math.max(0, pendingOwnReplayInputs - 1);
+    const first = ownReplayInputs.entries().next();
+    if (first.done) return;
+    const [key, count] = first.value;
+    if (count <= 1) ownReplayInputs.delete(key);
+    else ownReplayInputs.set(key, count - 1);
   };
 
   const consumeOwnReplay = (text: string, images: unknown): boolean => {
     const key = replayKey(text, images);
     const count = ownReplayInputs.get(key) ?? 0;
-    if (count <= 0) return false;
-    if (count === 1) ownReplayInputs.delete(key);
-    else ownReplayInputs.set(key, count - 1);
-    return true;
+    if (count > 0) {
+      pendingOwnReplayInputs = Math.max(0, pendingOwnReplayInputs - 1);
+      if (count === 1) ownReplayInputs.delete(key);
+      else ownReplayInputs.set(key, count - 1);
+      return true;
+    }
+
+    // An earlier input transformer may have changed the replay text/images
+    // before this handler runs. In that case, fall back to the pending replay
+    // count so our own replay still cannot recursively trigger compaction.
+    if (pendingOwnReplayInputs > 0) {
+      decrementAnyOwnReplay();
+      return true;
+    }
+
+    return false;
   };
 
   const sendOwnUserMessage = (content: UserReplayContent, options?: UserReplayOptions): void => {
@@ -336,15 +359,10 @@ export default function autoCompact(pi: ExtensionAPI) {
     return estimateMessageTokens({ role: "user", content, timestamp: Date.now() } as AgentMessage);
   };
 
-  const replayUserMessage = (
-    ctx: ExtensionContext,
-    content: UserReplayContent,
-  ): void => {
-    if (ctx.isIdle()) {
-      sendOwnUserMessage(content);
-      return;
-    }
-
+  const replayUserMessage = (content: UserReplayContent): void => {
+    // Always provide a queued delivery mode. When Pi is idle this starts a
+    // normal turn; if another turn wins the race between our idle check and
+    // Pi's async preflight, the captured prompt is queued instead of rejected.
     sendOwnUserMessage(content, { deliverAs: "followUp" });
   };
 
@@ -382,7 +400,7 @@ export default function autoCompact(pi: ExtensionAPI) {
             // another queued prompt won the post-compaction race. If another
             // turn is already running, preserve the original input as a
             // queued message rather than replacing it with a generic nudge.
-            replayUserMessage(ctx, content);
+            replayUserMessage(content);
           } else if (ctx.isIdle()) {
             sendOwnUserMessage(content);
           }
@@ -395,7 +413,7 @@ export default function autoCompact(pi: ExtensionAPI) {
           // will not process the user's prompt on the original path. If
           // summarization fails or is cancelled, re-submit the captured input
           // instead of silently dropping it.
-          setImmediate(() => replayUserMessage(ctx, replayAfterCompact));
+          setImmediate(() => replayUserMessage(replayAfterCompact));
         }
       },
     });
