@@ -22,8 +22,9 @@ starts.
 
 `ctx.compact()` aborts the running agent internally, so without a nudge the
 session would sit idle once the summary is written. For mid-turn, emergency,
-and session-resume compactions, this extension sends a short English follow-up
-user message to make pi resume the in-flight task.
+and session-resume compactions, this extension sends a hidden custom follow-up
+message to make pi resume the in-flight task without creating a visible user
+turn.
 
 Pre-turn compaction preserves the user's exact prompt instead. The `input`
 handler counts the just-submitted prompt in the threshold check, intercepts it
@@ -113,7 +114,7 @@ pi -e ./extensions/auto-compact.ts
 | Check timing | After `agent_end` only | Before user prompts + after tools |
 | Overflow protection | None | Emergency truncation |
 | Mid-turn handling | None | Checks after each tool batch |
-| Auto-continue | No | Yes — replays the original prompt for pre-turn compaction; otherwise sends an English follow-up nudge |
+| Auto-continue | No | Yes — replays the original prompt for pre-turn compaction; otherwise sends a hidden custom follow-up nudge |
 
 ## License
 

@@ -14,8 +14,8 @@
  * Follow-up after compaction:
  * `ctx.compact()` aborts the streaming agent internally, so the agent will be
  * idle once compaction finishes. Mid-turn, emergency, and session-resume
- * compactions therefore need a small follow-up user message to make pi resume
- * the in-flight task.
+ * compactions therefore need a small hidden custom message to make pi resume
+ * the in-flight task without appearing as a new user turn in the session UI.
  *
  * Pre-turn compaction is different: the user's just-submitted message has not
  * reached pi's message history yet. If we compact from `turn_start`, the abort
@@ -392,18 +392,26 @@ export default function autoCompact(pi: ExtensionAPI) {
         // settled into its final state. After setImmediate, isIdle()
         // honestly reflects whether anything else is about to drive a turn.
         setImmediate(() => {
-          const content = replayAfterCompact ?? (phase === "pre-turn" ? undefined : AUTO_COMPACT_FOLLOW_UP[phase]);
-          if (!content) return;
-
           if (replayAfterCompact !== undefined) {
             // The intercepted user prompt must not be dropped just because
             // another queued prompt won the post-compaction race. If another
             // turn is already running, preserve the original input as a
             // queued message rather than replacing it with a generic nudge.
-            replayUserMessage(content);
-          } else if (ctx.isIdle()) {
-            sendOwnUserMessage(content);
+            replayUserMessage(replayAfterCompact);
+            return;
           }
+
+          if (phase === "pre-turn" || !ctx.isIdle()) return;
+
+          pi.sendMessage(
+            {
+              customType: "auto-compact-follow-up",
+              content: AUTO_COMPACT_FOLLOW_UP[phase],
+              display: false,
+              details: { phase },
+            },
+            { triggerTurn: true },
+          );
         });
       },
       onError: () => {
