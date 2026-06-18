@@ -266,7 +266,6 @@ export default function autoCompact(pi: ExtensionAPI) {
   let truncationAppliedThisTurn = false;
 
   type UserReplayContent = Parameters<ExtensionAPI["sendUserMessage"]>[0];
-  type UserReplayOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
@@ -292,14 +291,13 @@ export default function autoCompact(pi: ExtensionAPI) {
   const replayUserMessage = (
     ctx: ExtensionContext,
     content: UserReplayContent,
-    options?: UserReplayOptions,
   ): void => {
     if (ctx.isIdle()) {
       pi.sendUserMessage(content);
       return;
     }
 
-    pi.sendUserMessage(content, options ?? { deliverAs: "followUp" });
+    pi.sendUserMessage(content, { deliverAs: "followUp" });
   };
 
   const triggerAutoCompact = (
@@ -307,7 +305,6 @@ export default function autoCompact(pi: ExtensionAPI) {
     phase: AutoCompactPhase,
     customInstructions?: string,
     replayAfterCompact?: UserReplayContent,
-    replayOptions?: UserReplayOptions,
   ): void => {
     pendingCompaction = true;
     ctx.compact({
@@ -337,7 +334,7 @@ export default function autoCompact(pi: ExtensionAPI) {
             // another queued prompt won the post-compaction race. If another
             // turn is already running, preserve the original input as a
             // queued message rather than replacing it with a generic nudge.
-            replayUserMessage(ctx, content, replayOptions);
+            replayUserMessage(ctx, content);
           } else if (ctx.isIdle()) {
             pi.sendUserMessage(content);
           }
@@ -350,7 +347,7 @@ export default function autoCompact(pi: ExtensionAPI) {
           // will not process the user's prompt on the original path. If
           // summarization fails or is cancelled, re-submit the captured input
           // instead of silently dropping it.
-          setImmediate(() => replayUserMessage(ctx, replayAfterCompact, replayOptions));
+          setImmediate(() => replayUserMessage(ctx, replayAfterCompact));
         }
       },
     });
@@ -427,6 +424,15 @@ export default function autoCompact(pi: ExtensionAPI) {
       return { action: "continue" as const };
     }
 
+    // Streaming steer/follow-up input arrives while an agent turn is already
+    // running. Calling ctx.compact() here would abort that active turn before Pi
+    // can queue the user's steer/follow-up. There is no safe extension-level
+    // deferred pre-turn hook for the later queued prompt, so let Pi queue it and
+    // rely on mid-turn/emergency protection instead of interrupting work now.
+    if (event.streamingBehavior) {
+      return { action: "continue" as const };
+    }
+
     // Extension commands are handled before the input event, but prompt
     // templates and /skill commands expand afterward. pi.sendUserMessage()
     // intentionally skips that expansion for extension-originated messages, so
@@ -444,7 +450,6 @@ export default function autoCompact(pi: ExtensionAPI) {
         "pre-turn",
         "Focus on preserving task context and recent work.",
         buildReplayContent(event.text, event.images),
-        event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined,
       );
       return { action: "handled" as const };
     }

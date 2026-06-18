@@ -31,10 +31,13 @@ when the projected request would cross the limit, and replays that original
 user message after compaction. If compaction fails or is cancelled, the captured
 prompt is re-submitted so the user's input is not lost. This avoids the
 `turn_start` race where compaction could abort the newly-started turn before
-the user's message reached chat history or `/tree`. Slash-prefixed inputs are
-left alone because pi expands prompt templates and `/skill` commands after the
-`input` event, while extension-originated replay intentionally skips that
-expansion.
+the user's message reached chat history or `/tree`.
+
+Slash-prefixed inputs are left alone because pi expands prompt templates and
+`/skill` commands after the `input` event, while extension-originated replay
+intentionally skips that expansion. Streaming steer/follow-up inputs are also
+left alone: compacting during the `input` event would abort the active turn
+before pi can queue the user's steer/follow-up.
 
 The follow-up is suppressed in two cases:
 
@@ -44,8 +47,9 @@ The follow-up is suppressed in two cases:
 - For generic mid-turn/emergency/session-resume nudges, the agent is no longer
   idle when the summary finishes, e.g. the user already typed something or
   another extension started a turn while summarising. Their input acts as the
-  kickoff and we stay quiet. Captured pre-turn prompts are different: they are
-  replayed even if that means queueing them behind another active turn.
+  kickoff and we stay quiet. Captured pre-turn prompts are different: once the
+  extension has returned `{ action: "handled" }`, they are replayed even if
+  that means queueing them behind another active turn.
 
 ### Compaction Strategies
 
