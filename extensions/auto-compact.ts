@@ -266,6 +266,7 @@ export default function autoCompact(pi: ExtensionAPI) {
   let truncationAppliedThisTurn = false;
 
   type UserReplayContent = Parameters<ExtensionAPI["sendUserMessage"]>[0];
+  type UserReplayOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
@@ -282,11 +283,31 @@ export default function autoCompact(pi: ExtensionAPI) {
     return [{ type: "text", text }, ...imageParts] as UserReplayContent;
   };
 
+  const estimateInputTokens = (text: string, images: unknown): number => {
+    const imageParts = Array.isArray(images) ? images : [];
+    const content = [{ type: "text", text }, ...imageParts];
+    return estimateMessageTokens({ role: "user", content, timestamp: Date.now() } as AgentMessage);
+  };
+
+  const replayUserMessage = (
+    ctx: ExtensionContext,
+    content: UserReplayContent,
+    options?: UserReplayOptions,
+  ): void => {
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(content);
+      return;
+    }
+
+    pi.sendUserMessage(content, options ?? { deliverAs: "followUp" });
+  };
+
   const triggerAutoCompact = (
     ctx: ExtensionContext,
     phase: AutoCompactPhase,
     customInstructions?: string,
     replayAfterCompact?: UserReplayContent,
+    replayOptions?: UserReplayOptions,
   ): void => {
     pendingCompaction = true;
     ctx.compact({
@@ -311,19 +332,26 @@ export default function autoCompact(pi: ExtensionAPI) {
           const content = replayAfterCompact ?? (phase === "pre-turn" ? undefined : AUTO_COMPACT_FOLLOW_UP[phase]);
           if (!content) return;
 
-          if (ctx.isIdle()) {
-            pi.sendUserMessage(content);
-          } else if (replayAfterCompact !== undefined) {
+          if (replayAfterCompact !== undefined) {
             // The intercepted user prompt must not be dropped just because
             // another queued prompt won the post-compaction race. If another
             // turn is already running, preserve the original input as a
-            // follow-up rather than replacing it with a generic nudge.
-            pi.sendUserMessage(content, { deliverAs: "followUp" });
+            // queued message rather than replacing it with a generic nudge.
+            replayUserMessage(ctx, content, replayOptions);
+          } else if (ctx.isIdle()) {
+            pi.sendUserMessage(content);
           }
         });
       },
       onError: () => {
         pendingCompaction = false;
+        if (replayAfterCompact !== undefined) {
+          // The input handler already returned `{ action: "handled" }`, so Pi
+          // will not process the user's prompt on the original path. If
+          // summarization fails or is cancelled, re-submit the captured input
+          // instead of silently dropping it.
+          setImmediate(() => replayUserMessage(ctx, replayAfterCompact, replayOptions));
+        }
       },
     });
   };
@@ -394,9 +422,8 @@ export default function autoCompact(pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     // Extension-injected replay/follow-up messages must not recursively trigger
-    // another pre-turn compaction. Streaming user input is already handled by
-    // pi's queue and should not be intercepted here either.
-    if (event.source === "extension" || event.streamingBehavior) {
+    // another pre-turn compaction.
+    if (event.source === "extension") {
       return { action: "continue" as const };
     }
 
@@ -410,12 +437,14 @@ export default function autoCompact(pi: ExtensionAPI) {
     }
 
     const tokens = getMeasuredTokenUsage(ctx);
-    if (tokens !== null && tokens >= cachedAutoCompactLimit && !pendingCompaction) {
+    const projectedTokens = tokens === null ? null : tokens + estimateInputTokens(event.text, event.images);
+    if (projectedTokens !== null && projectedTokens >= cachedAutoCompactLimit && !pendingCompaction) {
       triggerAutoCompact(
         ctx,
         "pre-turn",
         "Focus on preserving task context and recent work.",
         buildReplayContent(event.text, event.images),
+        event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined,
       );
       return { action: "handled" as const };
     }

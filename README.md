@@ -26,22 +26,26 @@ and session-resume compactions, this extension sends a short English follow-up
 user message to make pi resume the in-flight task.
 
 Pre-turn compaction preserves the user's exact prompt instead. The `input`
-handler intercepts the just-submitted prompt, runs compaction while the agent
-is still idle, and replays that original user message after compaction. This
-avoids the `turn_start` race where compaction could abort the newly-started
-turn before the user's message reached chat history or `/tree`. Slash-prefixed
-inputs are left alone because pi expands prompt templates and `/skill` commands
-after the `input` event, while extension-originated replay intentionally skips
-that expansion.
+handler counts the just-submitted prompt in the threshold check, intercepts it
+when the projected request would cross the limit, and replays that original
+user message after compaction. If compaction fails or is cancelled, the captured
+prompt is re-submitted so the user's input is not lost. This avoids the
+`turn_start` race where compaction could abort the newly-started turn before
+the user's message reached chat history or `/tree`. Slash-prefixed inputs are
+left alone because pi expands prompt templates and `/skill` commands after the
+`input` event, while extension-originated replay intentionally skips that
+expansion.
 
 The follow-up is suppressed in two cases:
 
 - The user ran `/compact` manually — the callback path used here only fires
   for compactions this extension started, so manual compaction is never
   touched.
-- The agent is no longer idle when the summary finishes, e.g. the user
-  already typed something or another extension started a turn while
-  summarising. Their input acts as the kickoff and we stay quiet.
+- For generic mid-turn/emergency/session-resume nudges, the agent is no longer
+  idle when the summary finishes, e.g. the user already typed something or
+  another extension started a turn while summarising. Their input acts as the
+  kickoff and we stay quiet. Captured pre-turn prompts are different: they are
+  replayed even if that means queueing them behind another active turn.
 
 ### Compaction Strategies
 
