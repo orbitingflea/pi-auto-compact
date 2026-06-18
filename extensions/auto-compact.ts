@@ -2,7 +2,8 @@
  * Pre-Turn Auto-Compaction for Pi
  *
  * This extension implements a proactive compaction strategy:
- * 1. Pre-turn check: Before each LLM request, check token usage
+ * 1. Pre-turn check: When user input arrives, check token usage before the
+ *    user message is handed to the agent
  * 2. Mid-turn check: After tool execution, before follow-up LLM calls
  * 3. Emergency: Synchronous truncation via `context` event as last resort
  *
@@ -12,12 +13,15 @@
  *
  * Follow-up after compaction:
  * `ctx.compact()` aborts the streaming agent internally, so the agent will be
- * idle once compaction finishes. Auto-compaction therefore needs a small
- * follow-up user message to make pi resume the in-flight task. We only send
- * the follow-up when (a) we triggered the compaction ourselves — guaranteed
- * by using `ctx.compact`'s `onComplete` callback, which never fires for the
- * user's manual `/compact` — and (b) the agent is still idle (i.e. the user
- * has not already typed something while we were summarising).
+ * idle once compaction finishes. Mid-turn, emergency, and session-resume
+ * compactions therefore need a small follow-up user message to make pi resume
+ * the in-flight task.
+ *
+ * Pre-turn compaction is different: the user's just-submitted message has not
+ * reached pi's message history yet. If we compact from `turn_start`, the abort
+ * can drop that message before `message_end` persists it. Instead, the
+ * `input` handler intercepts the prompt, compacts while idle, then replays the
+ * original user input after compaction completes.
  */
 
 import type { ExtensionAPI, ExtensionContext, AgentMessage } from "@earendil-works/pi-coding-agent";
@@ -261,20 +265,112 @@ export default function autoCompact(pi: ExtensionAPI) {
   let lastEstimatedTokens = 0;
   let truncationAppliedThisTurn = false;
 
+  type UserReplayContent = Parameters<ExtensionAPI["sendUserMessage"]>[0];
+  type UserReplayOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
+
+  const ownReplayInputs = new Map<string, number>();
+  let pendingOwnReplayInputs = 0;
+
+  const replayKey = (text: string, images: unknown): string => {
+    return `${text}\u0000${JSON.stringify(Array.isArray(images) ? images : [])}`;
+  };
+
+  const normalizeReplayContent = (content: UserReplayContent): { text: string; images?: unknown[] } => {
+    if (typeof content === "string") return { text: content };
+
+    const textParts: string[] = [];
+    const images: unknown[] = [];
+    for (const part of content) {
+      if (part.type === "text") {
+        textParts.push(part.text);
+      } else {
+        images.push(part);
+      }
+    }
+    return { text: textParts.join("\n"), images: images.length > 0 ? images : undefined };
+  };
+
+  const markOwnReplay = (content: UserReplayContent): void => {
+    const { text, images } = normalizeReplayContent(content);
+    const key = replayKey(text, images);
+    pendingOwnReplayInputs += 1;
+    ownReplayInputs.set(key, (ownReplayInputs.get(key) ?? 0) + 1);
+  };
+
+  const decrementAnyOwnReplay = (): void => {
+    pendingOwnReplayInputs = Math.max(0, pendingOwnReplayInputs - 1);
+    const first = ownReplayInputs.entries().next();
+    if (first.done) return;
+    const [key, count] = first.value;
+    if (count <= 1) ownReplayInputs.delete(key);
+    else ownReplayInputs.set(key, count - 1);
+  };
+
+  const consumeOwnReplay = (text: string, images: unknown): boolean => {
+    const key = replayKey(text, images);
+    const count = ownReplayInputs.get(key) ?? 0;
+    if (count > 0) {
+      pendingOwnReplayInputs = Math.max(0, pendingOwnReplayInputs - 1);
+      if (count === 1) ownReplayInputs.delete(key);
+      else ownReplayInputs.set(key, count - 1);
+      return true;
+    }
+
+    // An earlier input transformer may have changed the replay text/images
+    // before this handler runs. In that case, fall back to the pending replay
+    // count so our own replay still cannot recursively trigger compaction.
+    if (pendingOwnReplayInputs > 0) {
+      decrementAnyOwnReplay();
+      return true;
+    }
+
+    return false;
+  };
+
+  const sendOwnUserMessage = (content: UserReplayContent, options?: UserReplayOptions): void => {
+    markOwnReplay(content);
+    try {
+      pi.sendUserMessage(content, options);
+    } catch (error) {
+      const { text, images } = normalizeReplayContent(content);
+      consumeOwnReplay(text, images);
+      throw error;
+    }
+  };
+
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
   type AutoCompactPhase = "pre-turn" | "mid-turn" | "emergency" | "session-resume";
-  const AUTO_COMPACT_FOLLOW_UP: Record<AutoCompactPhase, string> = {
-    "pre-turn":       "Auto-compact ran before this turn. Continue with the current task.",
+  const AUTO_COMPACT_FOLLOW_UP: Record<Exclude<AutoCompactPhase, "pre-turn">, string> = {
     "mid-turn":       "Auto-compact ran mid-turn. Continue executing the remaining work.",
     "emergency":      "Emergency auto-compact ran. Resume where we left off.",
     "session-resume": "Auto-compact ran on session resume. Continue with the active task.",
+  };
+
+  const buildReplayContent = (text: string, images: unknown): UserReplayContent => {
+    const imageParts = Array.isArray(images) ? images : [];
+    if (imageParts.length === 0) return text;
+    return [{ type: "text", text }, ...imageParts] as UserReplayContent;
+  };
+
+  const estimateInputTokens = (text: string, images: unknown): number => {
+    const imageParts = Array.isArray(images) ? images : [];
+    const content = [{ type: "text", text }, ...imageParts];
+    return estimateMessageTokens({ role: "user", content, timestamp: Date.now() } as AgentMessage);
+  };
+
+  const replayUserMessage = (content: UserReplayContent): void => {
+    // Always provide a queued delivery mode. When Pi is idle this starts a
+    // normal turn; if another turn wins the race between our idle check and
+    // Pi's async preflight, the captured prompt is queued instead of rejected.
+    sendOwnUserMessage(content, { deliverAs: "followUp" });
   };
 
   const triggerAutoCompact = (
     ctx: ExtensionContext,
     phase: AutoCompactPhase,
     customInstructions?: string,
+    replayAfterCompact?: UserReplayContent,
   ): void => {
     pendingCompaction = true;
     ctx.compact({
@@ -287,24 +383,38 @@ export default function autoCompact(pi: ExtensionAPI) {
         // summarisation) synchronously off the `compaction_end` event,
         // and that flush runs `session.prompt()` without streamingBehavior.
         //
-        // If we send our nudge in the same tick we race that flush:
-        // whoever reaches `agent.run()` first sets isStreaming=true, and
-        // the other prompt() throws "Agent is already processing", which
-        // pi surfaces as "Failed to send queued message: ...".
+        // If we send in the same tick we race that flush: whoever reaches
+        // `agent.run()` first sets isStreaming=true, and the other prompt()
+        // throws "Agent is already processing", which pi surfaces as
+        // "Failed to send queued message: ...".
         //
         // Defer past all pending microtasks so that flush's prompt() has
         // settled into its final state. After setImmediate, isIdle()
-        // honestly reflects whether anything else is about to drive a
-        // turn. If something is, the new input acts as the follow-up and
-        // we stay quiet; otherwise we kick the agent ourselves.
+        // honestly reflects whether anything else is about to drive a turn.
         setImmediate(() => {
-          if (ctx.isIdle()) {
-            pi.sendUserMessage(AUTO_COMPACT_FOLLOW_UP[phase]);
+          const content = replayAfterCompact ?? (phase === "pre-turn" ? undefined : AUTO_COMPACT_FOLLOW_UP[phase]);
+          if (!content) return;
+
+          if (replayAfterCompact !== undefined) {
+            // The intercepted user prompt must not be dropped just because
+            // another queued prompt won the post-compaction race. If another
+            // turn is already running, preserve the original input as a
+            // queued message rather than replacing it with a generic nudge.
+            replayUserMessage(content);
+          } else if (ctx.isIdle()) {
+            sendOwnUserMessage(content);
           }
         });
       },
       onError: () => {
         pendingCompaction = false;
+        if (replayAfterCompact !== undefined) {
+          // The input handler already returned `{ action: "handled" }`, so Pi
+          // will not process the user's prompt on the original path. If
+          // summarization fails or is cancelled, re-submit the captured input
+          // instead of silently dropping it.
+          setImmediate(() => replayUserMessage(replayAfterCompact));
+        }
       },
     });
   };
@@ -337,10 +447,17 @@ export default function autoCompact(pi: ExtensionAPI) {
     }
   };
 
+  type UsageContext = {
+    getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+    model?: { contextWindow?: number };
+  };
+
   /**
-   * Get context usage from pi's API and update cached limits.
+   * Get measured context usage from pi's API and update cached limits.
+   * Returns null when pi intentionally reports usage as unknown, e.g. right
+   * after compaction before a post-compaction assistant response exists.
    */
-  const getTokenUsage = (ctx: { getContextUsage: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined; model?: { contextWindow?: number } }) => {
+  const getMeasuredTokenUsage = (ctx: UsageContext): number | null => {
     const usage = ctx.getContextUsage();
     
     // Update cached limits based on current model
@@ -353,20 +470,80 @@ export default function autoCompact(pi: ExtensionAPI) {
     if (usage && usage.tokens !== null) {
       return usage.tokens;
     }
-    return lastEstimatedTokens;
+    return null;
   };
 
-  pi.on("turn_start", async (event, ctx) => {
-    truncationAppliedThisTurn = false;
-    const tokens = getTokenUsage(ctx);
+  /**
+   * Get context usage, falling back to the last context-event estimate when
+   * no measured usage exists. This is useful mid-turn but intentionally not
+   * used for pre-turn input interception to avoid repeated compaction from a
+   * stale pre-compaction estimate.
+   */
+  const getTokenUsage = (ctx: UsageContext): number => {
+    return getMeasuredTokenUsage(ctx) ?? lastEstimatedTokens;
+  };
 
-    if (tokens >= cachedAutoCompactLimit) {
+  pi.on("input", async (event, ctx) => {
+    // Extension-injected replay/follow-up messages from this extension must not
+    // recursively trigger another pre-turn compaction. Other extensions' user
+    // messages are still eligible for the same threshold check.
+    if (event.source === "extension" && consumeOwnReplay(event.text, event.images)) {
+      return { action: "continue" as const };
+    }
+
+    // Non-TUI callers (print/json/SDK/RPC) expect their session.prompt() call
+    // to own the resulting turn. Replaying later via pi.sendUserMessage() would
+    // detach the response from the original request, so only TUI input is
+    // intercepted here.
+    if (ctx.mode !== "tui") {
+      return { action: "continue" as const };
+    }
+
+    // RPC callers should already be covered by ctx.mode, but keep the source
+    // guard for clarity and future mixed-mode entry points.
+    if (event.source === "rpc") {
+      return { action: "continue" as const };
+    }
+
+    // Streaming steer/follow-up input arrives while an agent turn is already
+    // running. Calling ctx.compact() here would abort that active turn before Pi
+    // can queue the user's steer/follow-up. There is no safe extension-level
+    // deferred pre-turn hook for the later queued prompt, so let Pi queue it and
+    // rely on mid-turn/emergency protection instead of interrupting work now.
+    if (event.streamingBehavior) {
+      return { action: "continue" as const };
+    }
+
+    // Extension commands are handled before the input event, but interactive
+    // prompt templates and /skill commands expand afterward. pi.sendUserMessage()
+    // intentionally skips that expansion, so do not intercept interactive
+    // slash-prefixed input unless pi exposes a replay path that preserves normal
+    // expansion semantics.
+    if (event.source === "interactive" && event.text.trimStart().startsWith("/")) {
+      return { action: "continue" as const };
+    }
+
+    const tokens = getMeasuredTokenUsage(ctx);
+    const projectedTokens = tokens === null ? null : tokens + estimateInputTokens(event.text, event.images);
+    if (projectedTokens !== null && projectedTokens >= cachedAutoCompactLimit && !pendingCompaction) {
+      // Returning handled necessarily owns replay for this event. Pi does not
+      // currently expose a normal-source, post-middleware replay path, so keep
+      // this path limited to TUI inputs where out-of-band replay preserves
+      // caller expectations.
       triggerAutoCompact(
         ctx,
         "pre-turn",
         "Focus on preserving task context and recent work.",
+        buildReplayContent(event.text, event.images),
       );
+      return { action: "handled" as const };
     }
+
+    return { action: "continue" as const };
+  });
+
+  pi.on("turn_start", async () => {
+    truncationAppliedThisTurn = false;
   });
 
   pi.on("context", async (event, ctx) => {
