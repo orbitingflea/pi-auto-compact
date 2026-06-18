@@ -266,6 +266,54 @@ export default function autoCompact(pi: ExtensionAPI) {
   let truncationAppliedThisTurn = false;
 
   type UserReplayContent = Parameters<ExtensionAPI["sendUserMessage"]>[0];
+  type UserReplayOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
+
+  const ownReplayInputs = new Map<string, number>();
+
+  const replayKey = (text: string, images: unknown): string => {
+    return `${text}\u0000${JSON.stringify(Array.isArray(images) ? images : [])}`;
+  };
+
+  const normalizeReplayContent = (content: UserReplayContent): { text: string; images?: unknown[] } => {
+    if (typeof content === "string") return { text: content };
+
+    const textParts: string[] = [];
+    const images: unknown[] = [];
+    for (const part of content) {
+      if (part.type === "text") {
+        textParts.push(part.text);
+      } else {
+        images.push(part);
+      }
+    }
+    return { text: textParts.join("\n"), images: images.length > 0 ? images : undefined };
+  };
+
+  const markOwnReplay = (content: UserReplayContent): void => {
+    const { text, images } = normalizeReplayContent(content);
+    const key = replayKey(text, images);
+    ownReplayInputs.set(key, (ownReplayInputs.get(key) ?? 0) + 1);
+  };
+
+  const consumeOwnReplay = (text: string, images: unknown): boolean => {
+    const key = replayKey(text, images);
+    const count = ownReplayInputs.get(key) ?? 0;
+    if (count <= 0) return false;
+    if (count === 1) ownReplayInputs.delete(key);
+    else ownReplayInputs.set(key, count - 1);
+    return true;
+  };
+
+  const sendOwnUserMessage = (content: UserReplayContent, options?: UserReplayOptions): void => {
+    markOwnReplay(content);
+    try {
+      pi.sendUserMessage(content, options);
+    } catch (error) {
+      const { text, images } = normalizeReplayContent(content);
+      consumeOwnReplay(text, images);
+      throw error;
+    }
+  };
 
   // Phase-specific follow-up nudges, sent only when auto-compaction completes
   // and the agent is still idle. Manual `/compact` never reaches this path.
@@ -293,11 +341,11 @@ export default function autoCompact(pi: ExtensionAPI) {
     content: UserReplayContent,
   ): void => {
     if (ctx.isIdle()) {
-      pi.sendUserMessage(content);
+      sendOwnUserMessage(content);
       return;
     }
 
-    pi.sendUserMessage(content, { deliverAs: "followUp" });
+    sendOwnUserMessage(content, { deliverAs: "followUp" });
   };
 
   const triggerAutoCompact = (
@@ -336,7 +384,7 @@ export default function autoCompact(pi: ExtensionAPI) {
             // queued message rather than replacing it with a generic nudge.
             replayUserMessage(ctx, content);
           } else if (ctx.isIdle()) {
-            pi.sendUserMessage(content);
+            sendOwnUserMessage(content);
           }
         });
       },
@@ -418,9 +466,17 @@ export default function autoCompact(pi: ExtensionAPI) {
   };
 
   pi.on("input", async (event, ctx) => {
-    // Extension-injected replay/follow-up messages must not recursively trigger
-    // another pre-turn compaction.
-    if (event.source === "extension") {
+    // Extension-injected replay/follow-up messages from this extension must not
+    // recursively trigger another pre-turn compaction. Other extensions' user
+    // messages are still eligible for the same threshold check.
+    if (event.source === "extension" && consumeOwnReplay(event.text, event.images)) {
+      return { action: "continue" as const };
+    }
+
+    // RPC callers expect their session.prompt() call to own the resulting turn;
+    // replaying later via pi.sendUserMessage() would detach the response from
+    // the original request. Let RPC prompts follow Pi's normal path.
+    if (event.source === "rpc") {
       return { action: "continue" as const };
     }
 
@@ -433,18 +489,22 @@ export default function autoCompact(pi: ExtensionAPI) {
       return { action: "continue" as const };
     }
 
-    // Extension commands are handled before the input event, but prompt
-    // templates and /skill commands expand afterward. pi.sendUserMessage()
-    // intentionally skips that expansion for extension-originated messages, so
-    // do not intercept slash-prefixed input unless pi exposes a replay path that
-    // preserves normal expansion semantics.
-    if (event.text.trimStart().startsWith("/")) {
+    // Extension commands are handled before the input event, but interactive
+    // prompt templates and /skill commands expand afterward. pi.sendUserMessage()
+    // intentionally skips that expansion, so do not intercept interactive
+    // slash-prefixed input unless pi exposes a replay path that preserves normal
+    // expansion semantics.
+    if (event.source === "interactive" && event.text.trimStart().startsWith("/")) {
       return { action: "continue" as const };
     }
 
     const tokens = getMeasuredTokenUsage(ctx);
     const projectedTokens = tokens === null ? null : tokens + estimateInputTokens(event.text, event.images);
     if (projectedTokens !== null && projectedTokens >= cachedAutoCompactLimit && !pendingCompaction) {
+      // Returning handled necessarily owns replay for this event. Pi does not
+      // currently expose a normal-source, post-middleware replay path, so keep
+      // this path limited to inputs where out-of-band replay preserves caller
+      // expectations: interactive prompts and non-RPC extension prompts.
       triggerAutoCompact(
         ctx,
         "pre-turn",
