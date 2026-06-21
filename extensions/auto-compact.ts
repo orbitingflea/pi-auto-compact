@@ -127,6 +127,29 @@ function estimateTotalTokens(messages: AgentMessage[]): number {
   return total;
 }
 
+type ContentBlockWithType = { type?: string };
+
+/** Pi persists tool calls as `toolCall`; keep `tool_use` for provider-style compatibility. */
+function isToolCallContentBlock(block: ContentBlockWithType): boolean {
+  return block.type === "toolCall" || block.type === "tool_use";
+}
+
+function hasAssistantToolCall(message: AgentMessage): boolean {
+  if (message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content)) {
+    return false;
+  }
+  return message.content.some(isToolCallContentBlock);
+}
+
+/** Prefer Pi's measured context usage; fall back when Pi reports usage as unknown. */
+function selectThresholdTokenUsage(measuredTokens: number | null, estimatedTokens: number): number {
+  return measuredTokens ?? estimatedTokens;
+}
+
+function isAtOrAboveLimit(tokens: number, limit: number): boolean {
+  return tokens >= limit;
+}
+
 /**
  * Snap a raw cut index forward to the nearest user-message boundary
  * so we never break a tool-call / tool-result pair.
@@ -559,9 +582,10 @@ export default function autoCompact(pi: ExtensionAPI) {
     const estimatedTokens = estimateTotalTokens(messages);
     lastEstimatedTokens = estimatedTokens;
 
-    updateCachedLimits(ctx as unknown as { model?: { contextWindow?: number } });
+    const measuredTokens = getMeasuredTokenUsage(ctx as UsageContext);
+    const thresholdTokens = selectThresholdTokenUsage(measuredTokens, estimatedTokens);
 
-    if (estimatedTokens > cachedAutoCompactLimit && !pendingCompaction) {
+    if (isAtOrAboveLimit(thresholdTokens, cachedAutoCompactLimit) && !pendingCompaction) {
       const newMessages = applyTruncationStrategy(messages, cachedKeepRecentTokens, config.strategy);
 
       if (newMessages) {
@@ -582,11 +606,7 @@ export default function autoCompact(pi: ExtensionAPI) {
   pi.on("turn_end", async (event, ctx) => {
     const { message } = event;
 
-    let hasToolCalls = false;
-    if (message.role === "assistant" && "content" in message && Array.isArray(message.content)) {
-      hasToolCalls = message.content.some((block: { type: string }) => block.type === "tool_use");
-    }
-    if (!hasToolCalls) return;
+    if (!hasAssistantToolCall(message)) return;
 
     const tokens = getTokenUsage(ctx);
     if (tokens >= cachedAutoCompactLimit && !pendingCompaction) {
